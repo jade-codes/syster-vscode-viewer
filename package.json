@@ -59,6 +59,7 @@
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "watch": "tsc -watch -p ./",
     "lint": "eslint client/src --ext ts",
+    "test": "echo \"No tests yet\" && exit 0",
     "package": "vsce package"
   },
   "dependencies": {

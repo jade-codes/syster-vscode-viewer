@@ -1,0 +1,19 @@
+# CI workflow using reusable syster-pipelines workflow
+# See: https://github.com/jade-codes/syster-pipelines
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**.ts'
+      - '**.json'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  vscode-ci:
+    uses: jade-codes/syster-pipelines/.github/workflows/vscode-ci.yml@main

@@ -192,7 +192,7 @@ export class DiagramPanel {
             return;
         }
         switch (message.type) {
-            case 'ready':
+            case 'ready': {
                 // Webview is ready, send initial diagram for current file only
                 const editor = vscode.window.activeTextEditor;
                 if (editor && this.isSysMLFile(editor.document)) {
@@ -205,6 +205,7 @@ export class DiagramPanel {
                     });
                 }
                 break;
+            }
             case 'refresh':
                 this.refreshDiagram(message.uri ? vscode.Uri.parse(message.uri) : undefined);
                 break;

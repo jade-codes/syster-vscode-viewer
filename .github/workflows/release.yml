@@ -1,0 +1,23 @@
+# Release workflow using reusable syster-pipelines workflow
+# See: https://github.com/jade-codes/syster-pipelines
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  vscode-release:
+    uses: jade-codes/syster-pipelines/.github/workflows/vscode-release.yml@main
+    secrets:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
