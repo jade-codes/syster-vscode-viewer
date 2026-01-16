@@ -1,0 +1,12 @@
+.git/**
+.github/**
+node_modules/**
+webview/**
+client/**
+*.ts
+*.map
+.gitignore
+tsconfig.json
+Makefile
+bun.lockb
+package-lock.json

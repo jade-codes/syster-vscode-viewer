@@ -42,10 +42,12 @@ export class DiagramPanel {
     private readonly extensionUri: vscode.Uri;
     private disposables: vscode.Disposable[] = [];
     private isDisposed = false;
+    private currentFileUri: vscode.Uri | undefined;
 
-    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
+    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, initialFileUri?: vscode.Uri) {
         this.panel = panel;
         this.extensionUri = extensionUri;
+        this.currentFileUri = initialFileUri;
 
         // Set the webview's initial html content
         this.update();
@@ -64,6 +66,7 @@ export class DiagramPanel {
         vscode.window.onDidChangeActiveTextEditor(
             (editor: vscode.TextEditor | undefined) => {
                 if (editor && this.isSysMLFile(editor.document)) {
+                    this.currentFileUri = editor.document.uri;
                     this.refreshDiagram(editor.document.uri);
                 }
             },
@@ -77,10 +80,21 @@ export class DiagramPanel {
      */
     public static createOrShow(extensionUri: vscode.Uri): DiagramPanel {
         const column = vscode.ViewColumn.Beside;
+        
+        // Capture the current file URI before creating the panel
+        const editor = vscode.window.activeTextEditor;
+        const initialFileUri = editor?.document.languageId === 'sysml' || editor?.document.languageId === 'kerml' 
+            ? editor.document.uri 
+            : undefined;
 
         // If we already have a panel, show it
         if (DiagramPanel.currentPanel) {
             DiagramPanel.currentPanel.panel.reveal(column);
+            // Update the current file if we have one
+            if (initialFileUri) {
+                DiagramPanel.currentPanel.currentFileUri = initialFileUri;
+                DiagramPanel.currentPanel.refreshDiagram(initialFileUri);
+            }
             return DiagramPanel.currentPanel;
         }
 
@@ -99,7 +113,7 @@ export class DiagramPanel {
             }
         );
 
-        DiagramPanel.currentPanel = new DiagramPanel(panel, extensionUri);
+        DiagramPanel.currentPanel = new DiagramPanel(panel, extensionUri, initialFileUri);
         return DiagramPanel.currentPanel;
     }
 
@@ -145,25 +159,26 @@ export class DiagramPanel {
             return;
         }
         try {
-            console.log('[DiagramPanel] Refreshing diagram for:', uri?.toString() || 'whole workspace');
+            const uriString = uri?.toString();
+            console.log('[DiagramPanel] Refreshing diagram for:', uriString || 'NO URI PROVIDED');
             const client = await this.getLspClient();
             
             // Check again after async operation
             if (this.isDisposed) {
                 return;
             }
-            console.log('[DiagramPanel] Got LSP client');
+            console.log('[DiagramPanel] Got LSP client, sending request with uri:', uriString);
 
             // Send custom request to LSP
             const result: DiagramData = await client.sendRequest('syster/getDiagram', {
-                uri: uri?.toString()
+                uri: uriString
             });
             
             // Check again after async operation
             if (this.isDisposed) {
                 return;
             }
-            console.log('[DiagramPanel] LSP response:', JSON.stringify(result, null, 2));
+            console.log('[DiagramPanel] LSP response: symbols=', result.symbols?.length, 'relationships=', result.relationships?.length);
 
             // Forward to webview
             this.panel.webview.postMessage({
@@ -193,20 +208,28 @@ export class DiagramPanel {
         }
         switch (message.type) {
             case 'ready':
-                // Webview is ready, send initial diagram for current file only
-                const editor = vscode.window.activeTextEditor;
-                if (editor && this.isSysMLFile(editor.document)) {
-                    this.refreshDiagram(editor.document.uri);
+                // Webview is ready, send initial diagram for current file
+                // Use stored file URI (captured when panel was opened)
+                if (this.currentFileUri) {
+                    this.refreshDiagram(this.currentFileUri);
                 } else {
-                    // No SysML file open - show empty state
-                    this.panel.webview.postMessage({
-                        type: 'diagram',
-                        data: { symbols: [], relationships: [] }
-                    });
+                    // Try active editor as fallback
+                    const editor = vscode.window.activeTextEditor;
+                    if (editor && this.isSysMLFile(editor.document)) {
+                        this.currentFileUri = editor.document.uri;
+                        this.refreshDiagram(editor.document.uri);
+                    } else {
+                        // No SysML file - show empty state
+                        this.panel.webview.postMessage({
+                            type: 'diagram',
+                            data: { symbols: [], relationships: [] }
+                        });
+                    }
                 }
                 break;
             case 'refresh':
-                this.refreshDiagram(message.uri ? vscode.Uri.parse(message.uri) : undefined);
+                // Refresh uses stored file URI, not undefined (which would load whole workspace)
+                this.refreshDiagram(message.uri ? vscode.Uri.parse(message.uri) : this.currentFileUri);
                 break;
             case 'navigate':
                 // Navigate to symbol in editor
