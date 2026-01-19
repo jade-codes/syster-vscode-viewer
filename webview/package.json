@@ -9,8 +9,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opensyster/diagram-core": "file:../../syster-repos/syster-diagram-core",
-    "@opensyster/diagram-ui": "file:../../syster-repos/syster-diagram-ui",
+    "@opensyster/diagram-core": "^0.0.3-alpha",
+    "@opensyster/diagram-ui": "^0.0.4-alpha",
     "@xyflow/react": "^12.10.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
