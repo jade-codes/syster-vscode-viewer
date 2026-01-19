@@ -3,3 +3,18 @@ dist/
 out/
 *.vsix
 .vscode-test/
+# Build artifacts
+*.map
+media/*.map
+
+# Coverage
+coverage/
+
+# Editor
+.vscode/
+
+# Backup files
+*.bak
+
+# Binary
+syster-lsp
