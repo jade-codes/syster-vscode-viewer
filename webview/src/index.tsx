@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   ReactFlow,
@@ -11,9 +11,30 @@ import {
   Node,
   Edge,
 } from '@xyflow/react';
-import { nodeTypes, edgeTypes } from '@syster/diagram-ui';
-import type { SymbolData } from '@syster/diagram-core';
+import { nodeTypes as baseNodeTypes, edgeTypes, SysMLNode } from '@opensyster/diagram-ui';
+import type { SymbolData } from '@opensyster/diagram-core';
 import '@xyflow/react/dist/style.css';
+
+// Debug: log available node types
+console.log('[Diagram] Available nodeTypes:', Object.keys(baseNodeTypes));
+console.log('[Diagram] nodeTypes object:', baseNodeTypes);
+
+// Create a fallback node component for unknown types
+const FallbackNode: React.FC<{ id: string; data: SymbolData }> = ({ data }) => (
+  <SysMLNode
+    id={data.qualifiedName}
+    data={data}
+    borderColor="#6b7280"
+    stereotype={data.kind || 'unknown'}
+    showFeatures={true}
+  />
+);
+
+// Extend nodeTypes with a default fallback
+const nodeTypes = {
+  ...baseNodeTypes,
+  default: FallbackNode,
+};
 
 // VS Code API for messaging
 declare function acquireVsCodeApi(): {
@@ -47,8 +68,71 @@ interface DiagramData {
   relationships: DiagramRelationship[];
 }
 
+// Types that should be shown as features inside their parent, not as separate nodes
+const FEATURE_TYPES = new Set([
+  'Attribute',      // AttributeUsage should be a feature
+  'Reference',      // ReferenceUsage should be a feature
+]);
+
+// Check if a symbol should be rendered as a feature inside parent, not a standalone node
+function isFeatureSymbol(symbol: DiagramSymbol): boolean {
+  if (symbol.kind === 'Usage' && symbol.usageKind) {
+    return FEATURE_TYPES.has(symbol.usageKind);
+  }
+  return false;
+}
+
+// Get parent qualified name from a qualified name (e.g., "A::B::C" -> "A::B")
+function getParentQualifiedName(qualifiedName: string): string | null {
+  const lastSeparator = qualifiedName.lastIndexOf('::');
+  if (lastSeparator === -1) return null;
+  return qualifiedName.substring(0, lastSeparator);
+}
+
+// Process symbols to attach features to their parent nodes
+function processSymbols(symbols: DiagramSymbol[]): DiagramSymbol[] {
+  // Build a map of qualified name -> symbol for quick lookup
+  const symbolMap = new Map<string, DiagramSymbol>();
+  symbols.forEach(s => symbolMap.set(s.qualifiedName, s));
+  
+  // Identify feature symbols and their parents
+  const featuresByParent = new Map<string, string[]>();
+  const topLevelSymbols: DiagramSymbol[] = [];
+  
+  for (const symbol of symbols) {
+    if (isFeatureSymbol(symbol)) {
+      // This is a feature - attach to parent
+      const parentQN = getParentQualifiedName(symbol.qualifiedName);
+      if (parentQN && symbolMap.has(parentQN)) {
+        const features = featuresByParent.get(parentQN) || [];
+        // Format as "name : type" or just "name"
+        const featureStr = symbol.typedBy 
+          ? `${symbol.name} : ${symbol.typedBy}`
+          : symbol.name;
+        features.push(featureStr);
+        featuresByParent.set(parentQN, features);
+      } else {
+        // Parent not found, show as standalone
+        topLevelSymbols.push(symbol);
+      }
+    } else {
+      // Top-level symbol
+      topLevelSymbols.push(symbol);
+    }
+  }
+  
+  // Attach features to parent symbols
+  return topLevelSymbols.map(symbol => ({
+    ...symbol,
+    features: [
+      ...(symbol.features || []),
+      ...(featuresByParent.get(symbol.qualifiedName) || []),
+    ],
+  }));
+}
+
 // Convert LSP symbol to React Flow node
-function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData> {
+function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData & { kind?: string }> {
   const cols = 4;
   const nodeWidth = 180;
   const nodeHeight = 100;
@@ -58,12 +142,22 @@ function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData> {
   const col = index % cols;
   
   // Determine node type based on kind
+  // The node type must match keys in nodeTypes from diagram-ui
   let nodeType = 'default';
   if (symbol.kind === 'Definition' && symbol.definitionKind) {
     nodeType = `${symbol.definitionKind}Def`;
   } else if (symbol.kind === 'Usage' && symbol.usageKind) {
     nodeType = `${symbol.usageKind}Usage`;
+  } else if (symbol.kind === 'Package') {
+    nodeType = 'Package';
+  } else if (symbol.kind === 'Feature') {
+    nodeType = 'Feature';
+  } else if (symbol.kind === 'Classifier' && symbol.definitionKind) {
+    nodeType = `${symbol.definitionKind}Def`;
   }
+  
+  // Debug: log node types being created
+  console.log(`[Diagram] Symbol: ${symbol.name}, kind=${symbol.kind}, defKind=${symbol.definitionKind}, usageKind=${symbol.usageKind} => nodeType=${nodeType}`);
   
   return {
     id: symbol.qualifiedName.replace(/::/g, '_'),
@@ -78,6 +172,7 @@ function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData> {
       features: symbol.features,
       typedBy: symbol.typedBy,
       direction: symbol.direction as 'in' | 'out' | 'inout' | undefined,
+      kind: nodeType, // Pass the computed nodeType for fallback rendering
     },
   };
 }
@@ -108,7 +203,11 @@ function DiagramApp() {
       switch (message.type) {
         case 'diagram': {
           const data = message.data as DiagramData;
-          const newNodes = data.symbols.map((s, i) => symbolToNode(s, i));
+          // Process symbols to attach features to parents (filter out attribute usages etc.)
+          const processedSymbols = processSymbols(data.symbols);
+          console.log(`[Diagram] Original: ${data.symbols.length} symbols, After processing: ${processedSymbols.length} nodes`);
+          
+          const newNodes = processedSymbols.map((s, i) => symbolToNode(s, i));
           const newEdges = data.relationships.map((r, i) => relationshipToEdge(r, i));
           
           setNodes(newNodes);
