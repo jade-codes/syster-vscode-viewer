@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   ReactFlow,
@@ -8,10 +8,12 @@ import {
   BackgroundVariant,
   useNodesState,
   useEdgesState,
+  useReactFlow,
   Node,
   Edge,
 } from '@xyflow/react';
-import { nodeTypes as baseNodeTypes, edgeTypes, SysMLNode } from '@opensyster/diagram-ui';
+import { nodeTypes as baseNodeTypes, edgeTypes } from '@opensyster/diagram-ui';
+import { applyElkLayout } from '@opensyster/diagram-ui/src/layout/elk-layout';
 import type { SymbolData } from '@opensyster/diagram-core';
 import '@xyflow/react/dist/style.css';
 
@@ -19,22 +21,9 @@ import '@xyflow/react/dist/style.css';
 console.log('[Diagram] Available nodeTypes:', Object.keys(baseNodeTypes));
 console.log('[Diagram] nodeTypes object:', baseNodeTypes);
 
-// Create a fallback node component for unknown types
-const FallbackNode: React.FC<{ id: string; data: SymbolData }> = ({ data }) => (
-  <SysMLNode
-    id={data.qualifiedName}
-    data={data}
-    borderColor="#6b7280"
-    stereotype={data.kind || 'unknown'}
-    showFeatures={true}
-  />
-);
-
-// Extend nodeTypes with a default fallback
-const nodeTypes = {
-  ...baseNodeTypes,
-  default: FallbackNode,
-};
+// baseNodeTypes already includes a 'default' entry (UnifiedSysMLNode),
+// so no fallback component is needed.
+const nodeTypes = baseNodeTypes;
 
 // VS Code API for messaging
 declare function acquireVsCodeApi(): {
@@ -45,13 +34,12 @@ declare function acquireVsCodeApi(): {
 
 const vscode = acquireVsCodeApi();
 
-// Types from LSP
+// Types from LSP — must match DiagramSymbol in diagram.rs (camelCase)
 interface DiagramSymbol {
   name: string;
   qualifiedName: string;
-  kind: string;
-  definitionKind?: string;
-  usageKind?: string;
+  nodeType: string;
+  parent?: string;
   features?: string[];
   typedBy?: string;
   direction?: string;
@@ -68,18 +56,15 @@ interface DiagramData {
   relationships: DiagramRelationship[];
 }
 
-// Types that should be shown as features inside their parent, not as separate nodes
-const FEATURE_TYPES = new Set([
-  'Attribute',      // AttributeUsage should be a feature
-  'Reference',      // ReferenceUsage should be a feature
+// Node types that should be shown as features inside their parent, not as separate nodes
+const FEATURE_NODE_TYPES = new Set([
+  'AttributeUsage',
+  'ReferenceUsage',
 ]);
 
 // Check if a symbol should be rendered as a feature inside parent, not a standalone node
 function isFeatureSymbol(symbol: DiagramSymbol): boolean {
-  if (symbol.kind === 'Usage' && symbol.usageKind) {
-    return FEATURE_TYPES.has(symbol.usageKind);
-  }
-  return false;
+  return FEATURE_NODE_TYPES.has(symbol.nodeType);
 }
 
 // Get parent qualified name from a qualified name (e.g., "A::B::C" -> "A::B")
@@ -137,34 +122,19 @@ function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData & {
   const nodeWidth = 180;
   const nodeHeight = 100;
   const gap = 40;
-  
+
   const row = Math.floor(index / cols);
   const col = index % cols;
-  
-  // Determine node type based on kind
-  // The node type must match keys in nodeTypes from diagram-ui
-  let nodeType = 'default';
-  if (symbol.kind === 'Definition' && symbol.definitionKind) {
-    nodeType = `${symbol.definitionKind}Def`;
-  } else if (symbol.kind === 'Usage' && symbol.usageKind) {
-    nodeType = `${symbol.usageKind}Usage`;
-  } else if (symbol.kind === 'Package') {
-    nodeType = 'Package';
-  } else if (symbol.kind === 'Feature') {
-    nodeType = 'Feature';
-  } else if (symbol.kind === 'Classifier' && symbol.definitionKind) {
-    nodeType = `${symbol.definitionKind}Def`;
-  }
-  
-  // Debug: log node types being created
-  console.log(`[Diagram] Symbol: ${symbol.name}, kind=${symbol.kind}, defKind=${symbol.definitionKind}, usageKind=${symbol.usageKind} => nodeType=${nodeType}`);
-  
+
+  // Use nodeType directly from LSP — it already matches NODE_TYPES keys
+  const nodeType = symbol.nodeType || 'default';
+
   return {
     id: symbol.qualifiedName.replace(/::/g, '_'),
     type: nodeType,
-    position: { 
-      x: col * (nodeWidth + gap) + gap, 
-      y: row * (nodeHeight + gap) + gap 
+    position: {
+      x: col * (nodeWidth + gap) + gap,
+      y: row * (nodeHeight + gap) + gap
     },
     data: {
       name: symbol.name,
@@ -172,28 +142,101 @@ function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData & {
       features: symbol.features,
       typedBy: symbol.typedBy,
       direction: symbol.direction as 'in' | 'out' | 'inout' | undefined,
-      kind: nodeType, // Pass the computed nodeType for fallback rendering
+      kind: nodeType,
     },
   };
 }
 
-// Convert LSP relationship to React Flow edge
-function relationshipToEdge(rel: DiagramRelationship, index: number): Edge {
-  return {
-    id: `edge_${index}`,
-    source: rel.source.replace(/::/g, '_'),
-    target: rel.target.replace(/::/g, '_'),
-    type: rel.type,
-    label: rel.type,
-  };
+/**
+ * Build a lookup from short name and qualified name to node ID.
+ * The LSP may use short names (e.g., "Engine") as edge targets,
+ * but node IDs use qualified names with :: replaced by _.
+ */
+function buildNameToIdMap(symbols: DiagramSymbol[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const s of symbols) {
+    const id = s.qualifiedName.replace(/::/g, '_');
+    map.set(s.qualifiedName, id);
+    // Also map short name — last writer wins if ambiguous, which is acceptable
+    map.set(s.name, id);
+  }
+  return map;
+}
+
+/** Resolve a relationship endpoint to a node ID using the name map */
+function resolveEndpoint(name: string, nameMap: Map<string, string>): string | null {
+  // Try exact match first (qualified name)
+  const exact = nameMap.get(name);
+  if (exact) return exact;
+  // Try as-is with :: replacement (in case it's already qualified)
+  const replaced = name.replace(/::/g, '_');
+  if (nameMap.has(name)) return replaced;
+  return null;
+}
+
+// Convert LSP relationships to React Flow edges, resolving targets.
+// Also adds containment edges from child symbols to their parent nodes.
+function relationshipsToEdges(
+  relationships: DiagramRelationship[],
+  symbols: DiagramSymbol[],
+): Edge[] {
+  const nameMap = buildNameToIdMap(symbols);
+  const nodeIds = new Set(nameMap.values());
+  const edges: Edge[] = [];
+  const edgeSet = new Set<string>(); // dedupe "source->target"
+
+  // 1. Explicit relationships from LSP (typing etc.)
+  for (let i = 0; i < relationships.length; i++) {
+    const rel = relationships[i];
+    const source = resolveEndpoint(rel.source, nameMap);
+    const target = resolveEndpoint(rel.target, nameMap);
+
+    if (source && target && source !== target) {
+      const key = `${source}->${target}`;
+      if (!edgeSet.has(key)) {
+        edgeSet.add(key);
+        edges.push({
+          id: `rel_${i}`,
+          source,
+          target,
+          type: rel.type,
+          label: rel.type,
+        });
+      }
+    }
+  }
+
+  // 2. Containment edges: connect child nodes to their parent nodes
+  for (const symbol of symbols) {
+    if (!symbol.parent) continue;
+    const childId = nameMap.get(symbol.qualifiedName);
+    const parentId = nameMap.get(symbol.parent);
+    if (childId && parentId && nodeIds.has(parentId) && childId !== parentId) {
+      const key = `${parentId}->${childId}`;
+      if (!edgeSet.has(key)) {
+        edgeSet.add(key);
+        edges.push({
+          id: `contain_${childId}`,
+          source: parentId,
+          target: childId,
+          type: 'containment',
+          label: '',
+        });
+      }
+    }
+  }
+
+  return edges;
 }
 
 function DiagramApp() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [loading, setLoading] = useState(true);
+  const [layouting, setLayouting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState({ nodes: 0, edges: 0 });
+  const { fitView } = useReactFlow();
 
   // Handle messages from extension
   useEffect(() => {
@@ -203,12 +246,14 @@ function DiagramApp() {
       switch (message.type) {
         case 'diagram': {
           const data = message.data as DiagramData;
+          // Filter out anonymous symbols (e.g., <anon#8@L0>)
+          const namedSymbols = data.symbols.filter(s => !s.name.startsWith('<anon'));
           // Process symbols to attach features to parents (filter out attribute usages etc.)
-          const processedSymbols = processSymbols(data.symbols);
-          console.log(`[Diagram] Original: ${data.symbols.length} symbols, After processing: ${processedSymbols.length} nodes`);
-          
+          const processedSymbols = processSymbols(namedSymbols);
+          console.log(`[Diagram] Original: ${data.symbols.length} symbols, Named: ${namedSymbols.length}, After processing: ${processedSymbols.length} nodes`);
+
           const newNodes = processedSymbols.map((s, i) => symbolToNode(s, i));
-          const newEdges = data.relationships.map((r, i) => relationshipToEdge(r, i));
+          const newEdges = relationshipsToEdges(data.relationships, processedSymbols);
           
           setNodes(newNodes);
           setEdges(newEdges);
@@ -238,6 +283,26 @@ function DiagramApp() {
     vscode.postMessage({ type: 'refresh' });
   }, []);
 
+  const handleTreeLayout = useCallback(async () => {
+    if (nodes.length === 0) return;
+    setLayouting(true);
+    try {
+      const layoutedNodes = await applyElkLayout(nodes, edges, {
+        algorithm: 'layered',
+        direction: 'DOWN',
+        nodeSpacing: 40,
+        layerSpacing: 60,
+      });
+      setNodes(layoutedNodes);
+      // Let React render the new positions, then fit view
+      requestAnimationFrame(() => fitView({ padding: 0.1 }));
+    } catch (err) {
+      console.error('[Diagram] Layout failed:', err);
+    } finally {
+      setLayouting(false);
+    }
+  }, [nodes, edges, setNodes, fitView]);
+
   if (error) {
     return (
       <div className="error-container">
@@ -252,6 +317,9 @@ function DiagramApp() {
       <div className="toolbar">
         <button onClick={handleRefresh} disabled={loading}>
           {loading ? 'Loading...' : '↻ Refresh'}
+        </button>
+        <button onClick={handleTreeLayout} disabled={loading || layouting || nodes.length === 0}>
+          {layouting ? 'Layouting...' : 'Tree Layout'}
         </button>
         <span className="stats">
           {stats.nodes} nodes, {stats.edges} edges
