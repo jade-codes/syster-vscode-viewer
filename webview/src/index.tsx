@@ -8,10 +8,12 @@ import {
   BackgroundVariant,
   useNodesState,
   useEdgesState,
+  useReactFlow,
   Node,
   Edge,
 } from '@xyflow/react';
 import { nodeTypes as baseNodeTypes, edgeTypes } from '@opensyster/diagram-ui';
+import { applyElkLayout } from '@opensyster/diagram-ui/src/layout/elk-layout';
 import type { SymbolData } from '@opensyster/diagram-core';
 import '@xyflow/react/dist/style.css';
 
@@ -172,28 +174,55 @@ function resolveEndpoint(name: string, nameMap: Map<string, string>): string | n
   return null;
 }
 
-// Convert LSP relationships to React Flow edges, resolving targets
+// Convert LSP relationships to React Flow edges, resolving targets.
+// Also adds containment edges from child symbols to their parent nodes.
 function relationshipsToEdges(
   relationships: DiagramRelationship[],
   symbols: DiagramSymbol[],
 ): Edge[] {
   const nameMap = buildNameToIdMap(symbols);
+  const nodeIds = new Set(nameMap.values());
   const edges: Edge[] = [];
+  const edgeSet = new Set<string>(); // dedupe "source->target"
 
+  // 1. Explicit relationships from LSP (typing etc.)
   for (let i = 0; i < relationships.length; i++) {
     const rel = relationships[i];
     const source = resolveEndpoint(rel.source, nameMap);
     const target = resolveEndpoint(rel.target, nameMap);
 
-    // Only create edge if both endpoints resolve to existing nodes
     if (source && target && source !== target) {
-      edges.push({
-        id: `edge_${i}`,
-        source,
-        target,
-        type: rel.type,
-        label: rel.type,
-      });
+      const key = `${source}->${target}`;
+      if (!edgeSet.has(key)) {
+        edgeSet.add(key);
+        edges.push({
+          id: `rel_${i}`,
+          source,
+          target,
+          type: rel.type,
+          label: rel.type,
+        });
+      }
+    }
+  }
+
+  // 2. Containment edges: connect child nodes to their parent nodes
+  for (const symbol of symbols) {
+    if (!symbol.parent) continue;
+    const childId = nameMap.get(symbol.qualifiedName);
+    const parentId = nameMap.get(symbol.parent);
+    if (childId && parentId && nodeIds.has(parentId) && childId !== parentId) {
+      const key = `${parentId}->${childId}`;
+      if (!edgeSet.has(key)) {
+        edgeSet.add(key);
+        edges.push({
+          id: `contain_${childId}`,
+          source: parentId,
+          target: childId,
+          type: 'containment',
+          label: '',
+        });
+      }
     }
   }
 
@@ -204,8 +233,10 @@ function DiagramApp() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [loading, setLoading] = useState(true);
+  const [layouting, setLayouting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState({ nodes: 0, edges: 0 });
+  const { fitView } = useReactFlow();
 
   // Handle messages from extension
   useEffect(() => {
@@ -252,6 +283,26 @@ function DiagramApp() {
     vscode.postMessage({ type: 'refresh' });
   }, []);
 
+  const handleTreeLayout = useCallback(async () => {
+    if (nodes.length === 0) return;
+    setLayouting(true);
+    try {
+      const layoutedNodes = await applyElkLayout(nodes, edges, {
+        algorithm: 'layered',
+        direction: 'DOWN',
+        nodeSpacing: 40,
+        layerSpacing: 60,
+      });
+      setNodes(layoutedNodes);
+      // Let React render the new positions, then fit view
+      requestAnimationFrame(() => fitView({ padding: 0.1 }));
+    } catch (err) {
+      console.error('[Diagram] Layout failed:', err);
+    } finally {
+      setLayouting(false);
+    }
+  }, [nodes, edges, setNodes, fitView]);
+
   if (error) {
     return (
       <div className="error-container">
@@ -266,6 +317,9 @@ function DiagramApp() {
       <div className="toolbar">
         <button onClick={handleRefresh} disabled={loading}>
           {loading ? 'Loading...' : '↻ Refresh'}
+        </button>
+        <button onClick={handleTreeLayout} disabled={loading || layouting || nodes.length === 0}>
+          {layouting ? 'Layouting...' : 'Tree Layout'}
         </button>
         <span className="stats">
           {stats.nodes} nodes, {stats.edges} edges
