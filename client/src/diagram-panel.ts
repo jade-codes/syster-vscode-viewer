@@ -20,9 +20,26 @@ interface DiagramRelationship {
     target: string;
 }
 
+interface DiagramError {
+    kind: string;
+    message: string;
+}
+
 interface DiagramData {
     symbols: DiagramSymbol[];
     relationships: DiagramRelationship[];
+    viewType?: string;
+    /** Present when the view could not be rendered; must be surfaced, not hidden. */
+    error?: DiagramError;
+}
+
+interface ViewInfo {
+    qualifiedName: string;
+    name: string;
+}
+
+interface GetSysMLViewsResult {
+    views: ViewInfo[];
 }
 
 interface WebviewMessage {
@@ -43,6 +60,8 @@ export class DiagramPanel {
     private disposables: vscode.Disposable[] = [];
     private isDisposed = false;
     private currentFileUri: vscode.Uri | undefined;
+    /** The SysML v2 view currently applied to the diagram. */
+    private currentViewType = 'GeneralView';
 
     private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, initialFileUri?: vscode.Uri) {
         this.panel = panel;
@@ -169,21 +188,33 @@ export class DiagramPanel {
             }
             console.log('[DiagramPanel] Got LSP client, sending request with uri:', uriString);
 
-            // Send custom request to LSP
+            // Send custom request to LSP, applying the currently-selected view.
             const result: DiagramData = await client.sendRequest('syster/getDiagram', {
-                uri: uriString
+                uri: uriString,
+                viewType: this.currentViewType
             });
-            
+
             // Check again after async operation
             if (this.isDisposed) {
                 return;
             }
+
+            // A view that could not be applied is an error the user must see —
+            // surface it explicitly instead of rendering an empty/fallback diagram.
+            if (result.error) {
+                console.warn('[DiagramPanel] view error:', result.error.kind, result.error.message);
+                vscode.window.showWarningMessage(`SysML view '${this.currentViewType}': ${result.error.message}`);
+                this.panel.webview.postMessage({ type: 'viewError', error: result.error, viewType: this.currentViewType });
+                return;
+            }
+
             console.log('[DiagramPanel] LSP response: symbols=', result.symbols?.length, 'relationships=', result.relationships?.length);
 
             // Forward to webview
             this.panel.webview.postMessage({
                 type: 'diagram',
-                data: result
+                data: result,
+                viewType: this.currentViewType
             });
             console.log('[DiagramPanel] Sent diagram to webview');
         } catch (error) {
@@ -195,6 +226,38 @@ export class DiagramPanel {
                 type: 'error',
                 message: `Failed to get diagram: ${message}`
             });
+        }
+    }
+
+    /**
+     * Prompt the user to pick a SysML v2 view (discovered via the LSP) and
+     * re-render the diagram with it applied.
+     */
+    public async selectView(): Promise<void> {
+        if (this.isDisposed) {
+            return;
+        }
+        try {
+            const client = await this.getLspClient();
+            const result: GetSysMLViewsResult = await client.sendRequest('syster/getSysMLViews', {});
+            const views = result.views ?? [];
+            if (views.length === 0) {
+                vscode.window.showInformationMessage('No SysML v2 views were discovered in the workspace.');
+                return;
+            }
+            const pick = await vscode.window.showQuickPick(
+                views.map((v) => ({ label: v.name, description: v.qualifiedName, view: v })),
+                { placeHolder: `Select a SysML v2 view (current: ${this.currentViewType})` }
+            );
+            if (!pick || this.isDisposed) {
+                return;
+            }
+            // Prefer the qualified name so the LSP can resolve the exact view def.
+            this.currentViewType = pick.view.qualifiedName || pick.view.name;
+            await this.refreshDiagram(this.currentFileUri);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to list SysML views: ${message}`);
         }
     }
 
@@ -230,6 +293,9 @@ export class DiagramPanel {
             case 'refresh':
                 // Refresh uses stored file URI, not undefined (which would load whole workspace)
                 this.refreshDiagram(message.uri ? vscode.Uri.parse(message.uri) : this.currentFileUri);
+                break;
+            case 'selectView':
+                void this.selectView();
                 break;
             case 'navigate':
                 // Navigate to symbol in editor

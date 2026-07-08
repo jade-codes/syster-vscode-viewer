@@ -16,6 +16,12 @@ await esbuild.build({
   format: 'iife',
   minify: !isDev,
   sourcemap: isDev ? 'inline' : false,
+  // Use the automatic JSX runtime so JSX compiles to `react/jsx-runtime`
+  // imports rather than `React.createElement`. diagram-ui is bundled from
+  // source and some of its files (e.g. nodes/nodeFactory.tsx) use JSX without
+  // importing the React default — the classic transform threw "React is not
+  // defined" at render time for those.
+  jsx: 'automatic',
   loader: {
     '.css': 'css',
   },

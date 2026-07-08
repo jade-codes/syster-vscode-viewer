@@ -11,30 +11,18 @@ import {
   Node,
   Edge,
 } from '@xyflow/react';
-import { nodeTypes as baseNodeTypes, edgeTypes, SysMLNode } from '@opensyster/diagram-ui';
-import type { SymbolData } from '@opensyster/diagram-core';
+import { nodeTypes as baseNodeTypes, edgeTypes } from '@opensyster/diagram-ui';
 import '@xyflow/react/dist/style.css';
 
 // Debug: log available node types
 console.log('[Diagram] Available nodeTypes:', Object.keys(baseNodeTypes));
-console.log('[Diagram] nodeTypes object:', baseNodeTypes);
 
-// Create a fallback node component for unknown types
-const FallbackNode: React.FC<{ id: string; data: SymbolData }> = ({ data }) => (
-  <SysMLNode
-    id={data.qualifiedName}
-    data={data}
-    borderColor="#6b7280"
-    stereotype={data.kind || 'unknown'}
-    showFeatures={true}
-  />
-);
-
-// Extend nodeTypes with a default fallback
-const nodeTypes = {
-  ...baseNodeTypes,
-  default: FallbackNode,
-};
+// Use diagram-ui's node types directly. It already registers a safe `default`
+// (UnifiedSysMLNode → getNodeConfig falls back to a valid config/category), so
+// unknown types render generically instead of crashing. A previous local
+// `FallbackNode` override called SysMLNode with a removed prop API and no
+// `category`, which threw inside the theme lookup and blanked the whole webview.
+const nodeTypes = baseNodeTypes;
 
 // VS Code API for messaging
 declare function acquireVsCodeApi(): {
@@ -132,7 +120,7 @@ function processSymbols(symbols: DiagramSymbol[]): DiagramSymbol[] {
 }
 
 // Convert LSP symbol to React Flow node
-function symbolToNode(symbol: DiagramSymbol, index: number): Node<SymbolData & { kind?: string }> {
+function symbolToNode(symbol: DiagramSymbol, index: number): Node {
   const cols = 4;
   const nodeWidth = 180;
   const nodeHeight = 100;
@@ -189,10 +177,11 @@ function relationshipToEdge(rel: DiagramRelationship, index: number): Edge {
 }
 
 function DiagramApp() {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [viewType, setViewType] = useState<string>('GeneralView');
   const [stats, setStats] = useState({ nodes: 0, edges: 0 });
 
   // Handle messages from extension
@@ -203,18 +192,32 @@ function DiagramApp() {
       switch (message.type) {
         case 'diagram': {
           const data = message.data as DiagramData;
+          if (message.viewType) setViewType(message.viewType);
           // Process symbols to attach features to parents (filter out attribute usages etc.)
           const processedSymbols = processSymbols(data.symbols);
           console.log(`[Diagram] Original: ${data.symbols.length} symbols, After processing: ${processedSymbols.length} nodes`);
-          
+
           const newNodes = processedSymbols.map((s, i) => symbolToNode(s, i));
           const newEdges = data.relationships.map((r, i) => relationshipToEdge(r, i));
-          
+
           setNodes(newNodes);
           setEdges(newEdges);
           setStats({ nodes: newNodes.length, edges: newEdges.length });
           setLoading(false);
           setError(null);
+          break;
+        }
+        case 'viewError': {
+          // The selected SysML v2 view could not be applied. Surface the error
+          // explicitly and clear the canvas — never fall back to a stale or
+          // generic diagram, so the problem with the view is unmistakable.
+          if (message.viewType) setViewType(message.viewType);
+          const err = message.error || {};
+          setNodes([]);
+          setEdges([]);
+          setStats({ nodes: 0, edges: 0 });
+          setError(`View error${err.kind ? ` (${err.kind})` : ''}: ${err.message || 'The selected view could not be rendered.'}`);
+          setLoading(false);
           break;
         }
         case 'error':
@@ -238,11 +241,18 @@ function DiagramApp() {
     vscode.postMessage({ type: 'refresh' });
   }, []);
 
+  const handleSelectView = useCallback(() => {
+    vscode.postMessage({ type: 'selectView' });
+  }, []);
+
   if (error) {
     return (
       <div className="error-container">
         <div className="error-message">{error}</div>
-        <button onClick={handleRefresh}>Retry</button>
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+          <button onClick={handleSelectView}>Select View…</button>
+          <button onClick={handleRefresh}>Retry</button>
+        </div>
       </div>
     );
   }
@@ -252,6 +262,9 @@ function DiagramApp() {
       <div className="toolbar">
         <button onClick={handleRefresh} disabled={loading}>
           {loading ? 'Loading...' : '↻ Refresh'}
+        </button>
+        <button onClick={handleSelectView} title="Select the SysML v2 view to render">
+          👁 View: {viewType}
         </button>
         <span className="stats">
           {stats.nodes} nodes, {stats.edges} edges
@@ -398,10 +411,51 @@ styles.textContent = `
 `;
 document.head.appendChild(styles);
 
+/**
+ * Catches render-time exceptions so a failure shows a visible message instead
+ * of unmounting the whole tree to a blank screen. Without this, any throw in a
+ * node/edge component (e.g. a bad theme lookup) silently blanks the webview.
+ */
+class DiagramErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error('[Diagram] Render error:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="error-container">
+          <div className="error-message">
+            Diagram failed to render: {this.state.error.message}
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 8 }}>
+            See the webview developer console for details.
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // Mount app
 const root = createRoot(document.getElementById('root')!);
 root.render(
-  <ReactFlowProvider>
-    <DiagramApp />
-  </ReactFlowProvider>
+  <DiagramErrorBoundary>
+    <ReactFlowProvider>
+      <DiagramApp />
+    </ReactFlowProvider>
+  </DiagramErrorBoundary>
 );
